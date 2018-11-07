@@ -1,0 +1,2 @@
+chainer>=4.2.0
+mojimoji>=0.0.8

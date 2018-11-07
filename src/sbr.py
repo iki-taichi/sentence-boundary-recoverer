@@ -104,7 +104,7 @@ class BoundaryRecoverer(object):
 
         d = os.path.dirname(__file__)
         for t in range(2):
-            p = os.path.join(d, 'model_train/boundary_ep_5.model')
+            p = os.path.join(d, 'model_train/boundary_last.model')
             if os.path.exists(p):
                 return p
             d = os.path.dirname(d)

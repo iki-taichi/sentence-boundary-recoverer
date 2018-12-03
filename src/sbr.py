@@ -23,9 +23,9 @@ import chainer
 import mojimoji
 
 try:
-    from jaembed import JaEmbedID
-except:
     from src.jaembed import JaEmbedID
+except:
+    from jaembed import JaEmbedID
 
 
 SYMBOL_BOS = '<BOS>'
@@ -37,7 +37,8 @@ BOUNDARIES = [
         '、',
         '。',
         '!',
-        '?'
+        '?',
+        '\n',
     ]
 
 
@@ -170,7 +171,7 @@ class SentenceBoundaryModel(chainer.Chain):
         
         self.charvec_dim = 128
         self.encode_layer_num = 1
-        self.encode_dim = 256
+        self.encode_dim = 512
         
         HeN = chainer.initializers.HeNormal
         with self.init_scope():

@@ -20,6 +20,7 @@ import os
 import time
 import re
 import numpy as np
+import json
 
 import chainer
 import chainer.links as L
@@ -48,34 +49,33 @@ class ArgSpace(object):
             self.dir_model = self.make_model_name(self.namespace)
         
         # dataset
-        # データセットは一行に1文のutf-8テキスト
-        self.dataset_sentences = [
-                'dataset/nuc_no_header.txt',
+        self.dataset_source = [
+                'dataset/livedoor_corpus.json',
             ]
+        # はじめにtrain, validに分ける直前だけで使う
+        self.dataset_shuffle_random = np.random.RandomState(8310174)
         
-        self.train_gpuid = 1
-        self.train_save_each = 5
+        self.train_gpuid = 0
+        self.train_save_each = 10
         self.train_max_sentence_len      = 1000
-        self.train_minibacth_size        = 16
-        self.train_minibacth_size_tuning = 16
+        self.train_minibacth_size        = 64
+        self.train_minibacth_size_tuning = 256
         
-        self.train_max_epoch   = 30
+        self.train_max_epoch   = 100
         self.train_schedule = {
-                 0: {'phase': 'boundary', 'lr': 1.0},
-                 10: {'phase': 'boundary', 'lr': 0.5},
-                 20: {'phase': 'boundary', 'lr': 0.25},
+                 0: {'phase': 'boundary'},
             }
+        self.alpha=0.001 # Adam
 
         self.train_unk_rate  = 0.30
         
-        self.weight_decay_rate = 1.0e-6
         self.gradient_clipping_threshold = 1.0
         
         self.read_ahead_len = 5
-        self.max_sample_sentence_count = 5
-        self.boundary_removing_rate = 0.80
+        self.max_sample_sentence_count = 1
+        self.boundary_removing_rate = 0.95
         
-        self.preload_model_path  = None
+        self.preload_model_path  = 'model_train/boundary_last.model'
         
     def make_model_name(self, namespace):
         import sys, re
@@ -87,16 +87,47 @@ class ArgSpace(object):
         return 'model_' + m.group(1)
 
 
-def read_sentences(paths):
-    sentences = []
+def read_dataset_source(paths):
+    blocks = []
     for path in paths:
-        lines = []
+        _blocks = []
         with open(path, 'r') as f:
-            lines = f.readlines()
-        lines = [l.strip() for l in lines]
-        lines = [normalize_text(l) for l in lines]
-        sentences.extend(lines)
-    return lines
+            _blocks = json.load(f)
+        _blocks = [b.strip() for b in _blocks]
+        _blocks = [normalize_text(b) for b in _blocks]
+        blocks.extend(_blocks)
+    return blocks
+
+
+def confuse_matrix(args, model, _dataset):
+    _dataset.reset_iteration(
+            mb_size=args.train_minibacth_size_tuning,
+            max_sentence_len=args.train_max_sentence_len,
+            max_sample_sentence_count=args.max_sample_sentence_count,
+            boundary_removing_rate=args.boundary_removing_rate,
+            postprocess=lambda x: model.xp.asarray(x),
+        )
+    
+    choice_count = len(BOUNDARIES)
+    mat = np.zeros((choice_count, choice_count), dtype='int32')
+    
+    with chainer.using_config('enable_backprop', False), \
+            chainer.using_config('train', False):
+        
+        for _, mb_xs, mb_ys, mb_xs_text in _dataset:
+            mb_size = mb_ys.shape[0]
+            
+            ps, _ = model.tf_loss(mb_xs, mb_ys)
+            
+            correct = mb_ys.flatten()
+            prediction = ps.data.argmax(axis=1)
+            
+            for i, j in zip(correct, prediction):
+                mat[int(i), int(j)] += 1
+    
+    print('# 第一成分:正解クラス, 第二成分:予測クラス')
+    print(mat)
+    exit()
 
 
 def train(args):
@@ -110,17 +141,17 @@ def train(args):
     #
     # DATASET
     #
-    sentences = read_sentences(args.dataset_sentences)
-    np.random.shuffle(sentences)
-    len_train = int(len(sentences)*0.8)
+    blocks = read_dataset_source(args.dataset_source)
+    args.dataset_shuffle_random.shuffle(blocks)
+    len_train = int(len(blocks)*0.9)
     
     datasets = {}
     datasets['boundary_train'] = BoundaryDataset(
-            sentences[:len_train], 'dynamic', 
+            blocks[:len_train], 'dynamic', 
             BOUNDARIES
         )
     datasets['boundary_tuning'] = BoundaryDataset(
-            sentences[len_train:], 'static', BOUNDARIES
+            blocks[len_train:], 'static', BOUNDARIES
         )
     for ds in datasets.values():
         print(ds.description())
@@ -139,7 +170,7 @@ def train(args):
                 read_ahead_len=args.read_ahead_len,
                 boundaries=BOUNDARIES,
                 embed_path=embed_path,
-                special_tokens=sp_char_list
+                special_tokens=sp_char_list,
             )
         boundary_model.embed.store_metadata(
                 os.path.join(args.dir_model, 'embed_meta.pklb')
@@ -148,7 +179,11 @@ def train(args):
         metadata_path = os.path.join(
                 os.path.dirname(args.preload_model_path), 'embed_meta.pklb'
             )
-        boundary_model = SentenceBoundaryModel(metadata_path=metadata_path)
+        boundary_model = SentenceBoundaryModel(
+                read_ahead_len=-1,
+                boundaries=BOUNDARIES,
+                metadata_path=metadata_path,
+            )
         chainer.serializers.load_npz(args.preload_model_path, boundary_model)
     models.append(boundary_model)
     
@@ -169,11 +204,8 @@ def train(args):
     #
     opts = {}
     for model in models:
-        opts[model] = chainer.optimizers.SGD(lr=1.0)
+        opts[model] = chainer.optimizers.Adam(alpha=args.alpha)
         opts[model].setup(model)
-        opts[model].add_hook(
-                WeightDecay(rate=args.weight_decay_rate)
-            )
         opts[model].add_hook(
                 GradientClipping(threshold=args.gradient_clipping_threshold)
             )
@@ -188,6 +220,9 @@ def train(args):
         )
     datasets['boundary_tuning'].register_token_mapping(boundary_model.ts2is)
     
+    # debug
+    # confuse_matrix(args, models[0], datasets['boundary_tuning'])
+    
     #
     # TRAINING LOOP
     #
@@ -196,10 +231,7 @@ def train(args):
         tstart = time.time()
         args.ep_id = ep_id
         if ep_id in args.train_schedule:
-            args.current_lr = args.train_schedule[ep_id]['lr']
             args.current_phase = args.train_schedule[ep_id]['phase']
-            for opt in opts.values():
-                opt.lr = args.current_lr
         
         current_log = ['ep=%d phase=%s'%(args.ep_id, args.current_phase)]
         
@@ -245,7 +277,7 @@ def epoch_boundary(args, models, opts, datasets, current_log):
             postprocess=lambda x: model.xp.asarray(x),
         )
     
-    print('epoch_boundary.train')
+    #print('epoch_boundary.train')
     with chainer.using_config('enable_backprop', True), \
             chainer.using_config('train', True):
         train_loss_mean, train_acc = ds_train.pour(args, model, opt)
@@ -261,7 +293,7 @@ def epoch_boundary(args, models, opts, datasets, current_log):
             postprocess=lambda x: model.xp.asarray(x),
         )
     
-    print('epoch_boundary.tuning')    
+    #print('epoch_boundary.tuning')    
     with chainer.using_config('enable_backprop', False), \
             chainer.using_config('train', False):
         eval_loss_mean, eval_acc = ds_tuning.pour(args, model, None)
@@ -276,13 +308,13 @@ class BoundaryDataset(object):
     
     def __init__(
             self, 
-            sentences, 
+            blocks, 
             dataset_type, 
             boundaries, 
             random_state=None
         ):
         self.keys = ['_mb_pointer', 'xs', 'ys', '_xs_text']
-        self.sentences = sentences
+        self.blocks = blocks
         self.dataset_type = dataset_type
         self.boundaries = boundaries
         self.random = random_state or np.random
@@ -292,7 +324,7 @@ class BoundaryDataset(object):
         s = [
                 'Dataset Description:',
                 '    type=%s'%'Boundary',
-                '    len_sentences=%d'%len(self.sentences),
+                '    len_blocks=%d'%len(self.blocks),
             ]
         return '\n'.join(s)
 
@@ -321,37 +353,43 @@ class BoundaryDataset(object):
     
     def _make_data_cache(self):
         """
-        [x] self.max_sample_sentence_count個, 文をサンプリングする
+        [x] self.max_sample_sentence_count個, ブロックをサンプリングする
         [x] 結合する
         [x] 文字にラベルを振る
         [x] 確率で境界文字を消す
         """
         
+        F_SURFACE=0
+        F_NEXT_BOUNDARY_ID=1
+        F_FILTER=2
+        
         data_cache = []
-        self.random.shuffle(self.sentences)
+        self.random.shuffle(self.blocks)
         i = 0
-        while i < len(self.sentences):
+        
+        while i < len(self.blocks):
             c = self.random.randint(1, self.max_sample_sentence_count+1)
-            text = ''.join(self.sentences[i:i+c])
-            buf = [[t, 0, True] for t in text]
+            text = ''.join(self.blocks[i:i+c])
+            char_info = [[t, 0, True] for t in text]
             # [surface, boundary_id, through filter]
             for j in range(len(text)-1):
-                next_char = buf[j+1][0]
-                if (next_char in self.boundaries) and \
+                next_char_info = char_info[j+1]
+                if (next_char_info[F_SURFACE] in self.boundaries) and \
                         self.random.uniform() < self.boundary_removing_rate:
-                    buf[j][1] = self.boundaries.index(next_char)
-                    buf[j+1][2] = False
-            buf = list(filter(lambda t: t[2], buf))
-            buf = buf[:self.max_sentence_len]
-            xs = self.ts2is_in(''.join([_[0] for _ in buf]))
-            ys = [_[1] for _ in buf]
+                    char_info[j][F_NEXT_BOUNDARY_ID] = \
+                            self.boundaries.index(next_char_info[F_SURFACE])
+                    next_char_info[F_FILTER] = False
+            char_info = list(filter(lambda _: _[F_FILTER], char_info))
+            char_info = char_info[:self.max_sentence_len]
+            xs = self.ts2is_in(''.join([_[F_SURFACE] for _ in char_info]))
+            ys = [_[F_NEXT_BOUNDARY_ID] for _ in char_info]
             
             data_cache.append({
                     'xs': xs,
                     'ys': ys,
                     '_xs_text': text,
                 })
-             
+            
             i+=c
     
         return data_cache
@@ -409,7 +447,7 @@ class BoundaryDataset(object):
         loss_sum       = 0
         loss_sum_count = 0
 
-        print_count = 0
+        #print_count = 0
         
         for mb_pointer, mb_xs, mb_ys, mb_xs_text in self:
             mb_size = mb_ys.shape[0]
@@ -432,10 +470,10 @@ class BoundaryDataset(object):
             loss_sum       += float(loss.data)*mb_size
             loss_sum_count += mb_size
             
-            print_count -= 1
-            if print_count <= 0:
-                print_count = 100
-                print(mb_pointer, total_mb, total_correct_ans/float(total_mb))
+            #print_count -= 1
+            #if print_count <= 0:
+            #    print_count = 100
+            #    print(mb_pointer, total_mb, total_correct_ans/float(total_mb))
         
         loss_mean = loss_sum / loss_sum_count
         acc = total_correct_ans/float(total_mb)
